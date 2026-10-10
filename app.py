@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -197,6 +198,33 @@ def add_recent_report(name: str, content: bytes, mime: str) -> None:
         },
     )
     st.session_state["recent_reports"] = reports[:10]
+
+
+def load_page_data(
+    uploaded_file: Any,
+    use_synthetic_demo: bool,
+) -> tuple[pd.DataFrame, dict[str, int], str]:
+    """Reuse cleaned data within this user's session until its source changes."""
+    if uploaded_file is not None:
+        cache_key = ("upload", uploaded_file.file_id, uploaded_file.size)
+        cached = st.session_state.get("_employee_data_cache")
+        if cached is not None and cached["key"] == cache_key:
+            return cached["data"]
+        data = load_employee_data(uploaded_file=BytesIO(uploaded_file.getvalue()))
+    else:
+        try:
+            stat = DATA_PATH.stat()
+            file_version = (stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            file_version = (0, 0)
+        cache_key = ("bundled", str(DATA_PATH), *file_version, use_synthetic_demo)
+        cached = st.session_state.get("_employee_data_cache")
+        if cached is not None and cached["key"] == cache_key:
+            return cached["data"]
+        data = load_employee_data(use_synthetic_demo=use_synthetic_demo)
+
+    st.session_state["_employee_data_cache"] = {"key": cache_key, "data": data}
+    return data
 
 
 def render_top_nav(page: str) -> None:
@@ -710,6 +738,7 @@ def render_reports(
     source: str,
     ml_result: dict[str, Any] | None,
     dashboard_filters: dict[str, Any],
+    model_df: pd.DataFrame,
 ) -> None:
     section_heading(
         "Reports",
@@ -727,6 +756,9 @@ def render_reports(
     )
     if st.button("Generate current report pack", type="primary"):
         report_date = datetime.now()
+        if ml_result is None and model_df["promotion_status"].isin(["Yes", "No"]).any():
+            with st.spinner("Evaluating the optional promotion model for its report…"):
+                ml_result = cached_model(model_df)
         summary_pdf = create_summary_report(
             df,
             source,
@@ -819,11 +851,7 @@ def main() -> None:
         st.info(f"Expected file location: `{DATA_PATH}`")
         return
     try:
-        df, quality, source = load_employee_data(
-            uploaded_file=uploaded,
-            csv_path=DATA_PATH,
-            use_synthetic_demo=use_demo,
-        )
+        df, quality, source = load_page_data(uploaded, use_demo)
     except (OSError, UnicodeError, ValueError, pd.errors.ParserError) as error:
         st.title("FairVision AI")
         st.error(f"Unable to load the employee dataset: {error}")
@@ -886,14 +914,12 @@ def main() -> None:
             departments=selected_departments,
             experience_range=exp_range,
         )
-        ml_result = None
-        if df["promotion_status"].isin(["Yes", "No"]).any():
-            ml_result = cached_model(df)
         render_reports(
             report_df,
             source,
-            ml_result,
+            None,
             {"departments": selected_departments, "experience": exp_range},
+            df,
         )
 
     st.markdown(
